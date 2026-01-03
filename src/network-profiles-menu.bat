@@ -2,7 +2,6 @@
 chcp 65001 >nul
 
 cd /d "%~dp0"
-
 set adm_arg=%1
 if "%adm_arg%" == "admin" (
     title admin
@@ -12,16 +11,11 @@ if "%adm_arg%" == "admin" (
     exit /b
 )
 
-:: Проверка прав администратора
-net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo ОШИБКА: Запустите файл от имени Администратора!
-    pause
-    exit /b
-)
+
 
 :menu
 setlocal enabledelayedexpansion
+set "DEBUG_MODE="
 cls
 set "choice_keys="
 :: Конфигурация меню (Массив данных)
@@ -30,16 +24,16 @@ set "menu_items[2]=DOWNLOAD: Max Throughput"
 set "menu_items[3]=RESTORE: Factory Defaults"
 set "menu_items[x]=Выход"
 
-echo [93m=========================================[0m
-echo [96m       ВЫБОР РЕЖИМА НАСТРОЙКИ СЕТИ      [0m
-echo [93m=========================================[0m
+echo [93m========================================[0m
+echo [96m        Network Profiles Manager
+echo [93m========================================[0m
 
 :: Автоматический вывод меню из массива
 for /f "tokens=2 delims=[]" %%i in ('set menu_items[') do (
     echo [96m %%i. !menu_items[%%i]![0m
     set "choice_keys=!choice_keys!%%i"
 )
-echo [93m=========================================[0m
+echo [93m========================================[0m
 
 echo.
 choice /C "!choice_keys!" /n /m "[93m[?] Выберите пункт:[0m"
@@ -53,6 +47,184 @@ if /i "%choice%"=="x" endlocal&exit
 goto menu
 
 
+:mode_gaming
+cls
+echo [90m[^>] Применяю игровой профиль...[0m
+
+call :network_stack "1"
+call :adapter_tuning "1"
+call :nagle "1"
+call :multimedia "gaming"
+call :tcp_params "1"
+call :qos_tuning "1"
+
+call :restart_net_adapter
+echo.
+echo Оптимизация завершена!
+goto endfunc
+
+
+:mode_download
+cls
+echo [90m[^>] Применяю профиль максимальной скорости...[0m
+call :network_stack "download"
+call :adapter_tuning "1"
+call :tcp_params "1"
+call :qos_tuning "1"
+call :nagle "reset"
+call :multimedia "reset"
+
+call :restart_net_adapter
+echo.
+echo Готово!
+goto endfunc
+
+
+:mode_default
+cls
+echo [90m[^>] Возврат к заводским настройкам (Гарантировано)...[0m
+
+call :network_stack "reset"
+call :adapter_tuning "reset"
+call :nagle "reset"
+call :multimedia "reset"
+call :tcp_params "reset"
+call :qos_tuning "reset"
+
+call :restart_net_adapter
+echo.
+echo Сброс завершен.
+goto endfunc
+
+
+
+:: --- ФУНКЦИИ-ДЕЛЕГАТЫ ---
+
+:network_stack
+:: %1: 1 (игры), download (скорость), 0 (стандарт), reset (сброс)
+echo [90m[^>] Настройка TCP/IP стека...[0m
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$mode = '%~1'; $debug = '%DEBUG_MODE%';" ^
+    "$bbr = (netsh int tcp show supplemental) -match 'bbr';" ^
+    "$provider = if ($mode -eq '1' -and $bbr) { 'bbr' } elseif ($mode -eq '1') { 'cubic' } else { 'ctcp' };" ^
+    "if ($debug -eq '1') { Write-Host \" [DEBUG] Провайдер: $provider\" -Fore Gray };" ^
+    "if ($mode -eq '1') {" ^
+    "    netsh int tcp set global rss=enabled rsc=disabled fastopen=enabled autotuninglevel=highlyrestricted ecncapability=disabled timestamps=disabled initialrto=2000 >$null 2>&1;" ^
+    "    netsh int tcp set supplemental template=custom congestionprovider=$provider >$null 2>&1;" ^
+    "    netsh int tcp set global dca=disabled >$null 2>&1; netsh int tcp set global netdma=disabled >$null 2>&1;" ^
+    "} elseif ($mode -eq 'download') {" ^
+    "    netsh int tcp set global rss=enabled rsc=enabled fastopen=enabled autotuninglevel=normal ecncapability=enabled timestamps=disabled initialrto=3000 >$null 2>&1;" ^
+    "    netsh int tcp set supplemental template=custom congestionprovider=ctcp >$null 2>&1;" ^
+    "} elseif ($mode -eq 'reset') {" ^
+    "    netsh int ip reset >$null 2>&1; netsh int tcp reset >$null 2>&1; netsh winsock reset >$null 2>&1;" ^
+    "}"
+exit /b
+
+
+:adapter_tuning
+:: %1: 1 - твик, 0/reset - дефолт
+echo [90m[^>] Настройка свойств сетевых адаптеров (PS)...[0m
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$mode = '%~1'; $debug = '%DEBUG_MODE%';" ^
+    "$cpuCores = [Environment]::ProcessorCount;" ^
+    "$rssQueues = [Math]::Max(1, [Math]::Min(4, [Math]::Floor($cpuCores / 2)));" ^
+    "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Physical } | ForEach-Object {" ^
+    "    $n = $_.Name;" ^
+    "    $props = if ($mode -eq '1') { @{'*InterruptModeration'='0'; '*FlowControl'='0'; '*EEE'='0'; '*NumRssQueues'=\"$rssQueues\"; '*RSS'='1'} } " ^
+    "             else { @{'*InterruptModeration'='1'; '*FlowControl'='3'; '*EEE'='1'; '*RSS'='1'} };" ^
+    "    foreach ($k in $props.Keys) {" ^
+    "        $current = Get-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $k -ErrorAction SilentlyContinue;" ^
+    "        if ($current -and $current.RegistryValue -ne $props[$k]) {" ^
+    "            if ($debug -eq '1') { Write-Host (' [DEBUG] ' + $n + ' : ' + $k + ' -> ' + $props[$k]) -Fore Gray };" ^
+    "            Set-NetAdapterAdvancedProperty -Name $n -RegistryKeyword $k -RegistryValue $props[$k] -NoRestart -ErrorAction SilentlyContinue;" ^
+    "        }" ^
+    "    }" ^
+    "    if ($mode -eq '1') { Disable-NetAdapterPowerManagement -Name $n -ErrorAction SilentlyContinue }" ^
+    "    else { Enable-NetAdapterPowerManagement -Name $n -ErrorAction SilentlyContinue }" ^
+    "}"
+exit /b
+
+
+:nagle
+:: %1: 1 - твик, 0/reset - дефолт
+echo [90m[^>] Настройка алгоритма Nagle...[0m
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$mode = '%~1';" ^
+    "$regPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\';" ^
+    "Get-ChildItem -Path $regPath | ForEach-Object {" ^
+    "    $path = $_.PSPath;" ^
+    "    $isIface = Get-ItemProperty -Path $path -Name 'IPAddress', 'DhcpIPAddress' -ErrorAction SilentlyContinue;" ^
+    "    if ($isIface) {" ^
+    "        if ($mode -eq '1') {" ^
+    "            Set-ItemProperty -Path $path -Name 'TcpAckFrequency' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue;" ^
+    "            Set-ItemProperty -Path $path -Name 'TCPNoDelay' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue;" ^
+    "            Set-ItemProperty -Path $path -Name 'TcpDelAckTicks' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue;" ^
+    "        } else {" ^
+    "            Remove-ItemProperty -Path $path -Name 'TcpAckFrequency', 'TCPNoDelay', 'TcpDelAckTicks' -Force -ErrorAction SilentlyContinue;" ^
+    "        }" ^
+    "    }" ^
+    "}"
+exit /b
+
+
+:multimedia
+echo [90m[^>] Настройка приоритетов Multimedia/Games...[0m
+setlocal
+set "regPath=HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+if "%~1"=="gaming" (
+    :: Проверяем только один ключ для экономии времени, если он ок - считаем что профиль применен
+    for /f "tokens=3" %%a in ('reg query "%regPath%" /v SystemResponsiveness 2^>nul') do if "%%a"=="0x0" goto :skip_multimedia
+    reg add "%regPath%" /v NetworkThrottlingIndex /t REG_DWORD /d 4294967295 /f >nul
+    reg add "%regPath%" /v SystemResponsiveness /t REG_DWORD /d 0 /f >nul
+    reg add "%regPath%\Tasks\Games" /v "GPU Priority" /t REG_DWORD /d 8 /f >nul
+    reg add "%regPath%\Tasks\Games" /v Priority /t REG_DWORD /d 6 /f >nul
+) else (
+    reg add "%regPath%" /v NetworkThrottlingIndex /t REG_DWORD /d 10 /f >nul
+    reg add "%regPath%" /v SystemResponsiveness /t REG_DWORD /d 20 /f >nul
+    reg add "%regPath%\Tasks\Games" /v Priority /t REG_DWORD /d 2 /f >nul
+)
+:skip_multimedia
+endlocal
+exit /b
+
+
+:tcp_params
+:: %1: 1 - твик, reset/0 - удаление ключей (дефолт)
+echo [90m[^>] Настройка лимитов TCP портов...[0m
+if "%~1"=="1" (
+    reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v MaxUserPort /t REG_DWORD /d 65534 /f >nul
+    reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpMaxDataRetransmissions /t REG_DWORD /d 5 /f >nul
+    reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpTimedWaitDelay /t REG_DWORD /d 30 /f >nul
+) else (
+    reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v MaxUserPort /f >nul 2>&1
+    reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpMaxDataRetransmissions /f >nul 2>&1
+    reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpTimedWaitDelay /f >nul 2>&1
+)
+exit /b
+
+
+:qos_tuning
+:: %1: 1 - убрать лимит, reset - вернуть 20%
+echo [90m[^>] Настройка планировщика пакетов QoS...[0m
+if "%~1"=="1" (
+    reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched" /v NonBestEffortLimit /t REG_DWORD /d 0 /f >nul 2>&1
+) else (
+    reg delete "HKLM\SOFTWARE\Policies\Microsoft\Windows\Psched" /v NonBestEffortLimit /f >nul 2>&1
+)
+exit /b
+
+
+:restart_net_adapter
+echo.
+echo [90m[^>] Перезапуск сетевых адаптеров...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+ "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Physical } | Restart-NetAdapter -Confirm:$false"
+ipconfig /flushdns >nul 2>&1
+echo Готово[0m
+exit /b
+
+
+
 :: end of a function
 :endfunc
 echo.&echo [36m[!time!] Выполнение завершено^^!
@@ -62,174 +234,3 @@ pause>nul&endlocal&cls
 goto :menu
 
 
-:mode_gaming
-cls
-echo [^>] Применяю игровой профиль...
-call :set_autotuning "normal"
-call :set_fastopen "1"
-call :set_dca "1"
-call :set_ecn "0"
-call :set_rss "1"
-call :set_rsc "0"
-call :set_nodelay "1"
-
-:: Доп. настройки через реестр и PS
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ^
- "$a = Get-NetAdapter | Where-Object Status -eq 'Up';" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*InterruptModeration' -RegistryValue '0' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*PriorityVLANTag' -RegistryValue '0' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*ReceiveSideScaling' -RegistryValue '1' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*FlowControl' -RegistryValue '0' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*NumRssQueues' -RegistryValue '4' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*EEE' -RegistryValue '0' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Set-NetAdapterAdvancedProperty -RegistryKeyword '*IdleRestriction' -RegistryValue '0' -ErrorAction SilentlyContinue | Out-Null;" ^
- "$a | Disable-NetAdapterPowerManagement;" ^
- "exit 0;"
-
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v "NetworkThrottlingIndex" /t REG_DWORD /d 0xffffffff /f >nul
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v "SystemResponsiveness" /t REG_DWORD /d 0 /f >nul
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v "MaxUserPort" /t REG_DWORD /d 65534 /f >nul
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v "TcpMaxDataRetransmissions" /t REG_DWORD /d 2 /f >nul
-
-call :restart_net_adapter
-
-echo.
-echo Готово^^!
-goto endfunc
-
-
-
-:mode_download
-:: Throughput
-cls
-echo [^>] Применяю профиль для закачек...
-call :set_autotuning "normal"
-call :set_dca "1"
-call :set_ecn "0"
-call :set_rss "1"
-call :set_rsc "1"
-call :set_timestamps "1"
-call :set_nodelay "0"
-
-powershell -Command "Get-NetAdapter | Where-Object Status -eq 'Up' | Set-NetAdapterAdvancedProperty -RegistryKeyword '*InterruptModeration' -RegistryValue '1' -ErrorAction SilentlyContinue | Out-Null"
-:: Настройка TCP Window
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v "TcpWindowSize" /t REG_DWORD /d 65535 /f >nul
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v "NetworkThrottlingIndex" /t REG_DWORD /d 10 /f
-
-call :restart_net_adapter
-
-echo.
-echo Готово!
-goto endfunc
-
-
-
-:mode_default
-:: Restore defaults
-cls
-echo [^>] Возврат к заводским настройкам Windows ...
-
-:: Очистка DNS
-ipconfig /flushdns >nul
-:: Сброс IP/TCP
-netsh int ip reset >nul
-netsh int tcp reset >nul
-:: Сброс Winsock
-netsh winsock reset >nul
-:: Cброс шаблонов TCP
-netsh int tcp set supplemental template=internet setup
-netsh int tcp set global autotuninglevel=normal
-:: Удаляем пользовательские реестровые ключи
-reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v NetworkThrottlingIndex /f >nul
-reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" /v SystemResponsiveness /f >nul
-reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v MaxUserPort /f >nul
-reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpMaxDataRetransmissions /f >nul
-for /F "tokens=1,2*" %%i in ('reg query HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces /s ^| findstr /I "Interface"') do (
-    reg delete "%%j" /v TcpAckFrequency /f 2>nul
-    reg delete "%%j" /v TCPNoDelay /f 2>nul
-    reg delete "%%j" /v TcpDelAckTicks /f 2>nul
-)
-
-call :restart_net_adapter
-
-echo Сброс завершён. Перезагрузите компьютер, чтобы изменения вступили в силу.
-goto endfunc
-
-
-:restart_net_adapter
-echo.&echo [90mперезапуск сетевого адаптера...[0m
-powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command ^
-Get-NetAdapter ^| Where-Object { $_.Status -eq 'Up' } ^| Restart-NetAdapter -Confirm^:$false
-exit/b
-
-
-:set_autotuning
-netsh int tcp set global autotuninglevel=%~1 >nul
-exit /b
-
-
-:set_ecn
-if "%~1"=="0" (
-    netsh int tcp set global ecncapability=disabled >nul 2>&1
-) else (
-    netsh int tcp set global ecncapability=enabled >nul 2>&1
-)
-exit /b
-
-
-:set_dca
-if "%~1"=="0" (netsh int tcp set global dca=disabled >nul) else (netsh int tcp set global dca=enabled >nul)
-exit /b
-
-
-:set_rss
-if "%~1"=="0" (
-    netsh int tcp set global rss=disabled >nul
-    powershell -Command "Disable-NetAdapterRss -Name '*'" >nul 2>&1
-) else (
-    netsh int tcp set global rss=enabled >nul
-    powershell -Command "Enable-NetAdapterRss -Name '*'" >nul 2>&1
-)
-exit /b
-
-
-:set_rsc
-if "%~1"=="0" (
-    netsh int tcp set global rsc=disabled >nul
-    powershell -Command "Disable-NetAdapterRsc -Name '*'" >nul 2>&1
-) else (
-    netsh int tcp set global rsc=enabled >nul
-    powershell -Command "Enable-NetAdapterRsc -Name '*'" >nul 2>&1
-)
-exit /b
-
-
-:set_timestamps
-if "%~1"=="0" (netsh int tcp set global timestamps=disabled >nul) else (netsh int tcp set global timestamps=enabled >nul)
-exit /b
-
-
-:set_nodelay
-if "%~1"=="1" (
-    for /f %%i in ('reg query "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"') do (
-        reg add "%%i" /v "TcpAckFrequency" /t REG_DWORD /d 1 /f >nul 2>&1
-        reg add "%%i" /v "TCPNoDelay" /t REG_DWORD /d 1 /f >nul 2>&1
-        reg add "%%i" /v "TcpDelAckTicks" /t REG_DWORD /d 0 /f >nul 2>&1
-    )
-) else (
-    for /f %%i in ('reg query "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"') do (
-        reg delete "%%i" /v "TcpAckFrequency" /f >nul 2>&1
-        reg delete "%%i" /v "TCPNoDelay" /f >nul 2>&1
-        reg delete "%%i" /v "TcpDelAckTicks" /f >nul 2>&1
-    )
-)
-exit /b
-
-
-:set_fastopen
-if "%~1"=="0" (
-    netsh int tcp set global fastopen=disabled >nul
-) else (
-    netsh int tcp set global fastopen=enabled >nul
-)
-exit /b
