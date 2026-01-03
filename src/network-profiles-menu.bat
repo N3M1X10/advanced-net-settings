@@ -109,7 +109,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$provider = if ($mode -eq '1' -and $bbr) { 'bbr' } elseif ($mode -eq '1') { 'cubic' } else { 'ctcp' };" ^
     "if ($debug -eq '1') { Write-Host \" [DEBUG] Провайдер: $provider\" -Fore Gray };" ^
     "if ($mode -eq '1') {" ^
-    "    netsh int tcp set global rss=enabled rsc=disabled fastopen=enabled autotuninglevel=highlyrestricted ecncapability=disabled timestamps=disabled initialrto=2000 >$null 2>&1;" ^
+    "    netsh int tcp set global rss=enabled rsc=disabled fastopen=enabled autotuninglevel=normal ecncapability=disabled timestamps=disabled initialrto=2000 >$null 2>&1;" ^
     "    netsh int tcp set supplemental template=custom congestionprovider=$provider >$null 2>&1;" ^
     "    netsh int tcp set global dca=disabled >$null 2>&1; netsh int tcp set global netdma=disabled >$null 2>&1;" ^
     "} elseif ($mode -eq 'download') {" ^
